@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -57,6 +57,7 @@ public class SmoothSave : BaseUnityPlugin
 	private static readonly List<int> removedIndices = new();
 	private static Dictionary<ZDOID, int>? copiedZdoIndices;
 	private static List<ZDO> copiedZdos = null!;
+	private static List<ZoneSystem.ChunkIndex> copiedZdoChunks = null!;
 	private static Dictionary<ZDOID, BinarySearchDictionary<int, float>> copiedZdo_floats = new();
 	private static Dictionary<ZDOID, BinarySearchDictionary<int, Vector3>> copiedZdo_vec3 = new();
 	private static Dictionary<ZDOID, BinarySearchDictionary<int, Quaternion>> copiedZdo_quats = new();
@@ -194,6 +195,7 @@ public class SmoothSave : BaseUnityPlugin
 					copiedZdo_longs.Remove(zdoid);
 					copiedZdo_strings.Remove(zdoid);
 					copiedZdo_byteArrays.Remove(zdoid);
+					// Keep chunk buffer compacting in the final stage to avoid invalidating pending indices.
 				}
 			}
 
@@ -225,10 +227,11 @@ public class SmoothSave : BaseUnityPlugin
 	{
 		private static void AddZdo(ZDO zdo, int index)
 		{
-			if (copiedZdoIndices != null && index < copyingSectorId && zdo.Persistent)
+			if (copiedZdoIndices != null && copiedZdoChunks != null && index < copyingSectorId && zdo.Persistent)
 			{
 				copiedZdoIndices.Add(zdo.m_uid, copiedZdos.Count);
 				copiedZdos.Add(zdo);
+				copiedZdoChunks.Add(ZoneSystem.GetZonesChunk(zdo.GetSectorIndex()));
 				UpdateZDOExtraData(zdo.m_uid);
 			}
 		}
@@ -303,6 +306,7 @@ public class SmoothSave : BaseUnityPlugin
 
 				Dictionary<ZDOID, int> zdoIndex = new();
 				List<ZDO> saveZDOs = new();
+				List<ZoneSystem.ChunkIndex> saveZDOChunks = new();
 
 				Dictionary<ZDOID, BinarySearchDictionary<int, float>> zdo_floats = new();
 				Dictionary<ZDOID, BinarySearchDictionary<int, Vector3>> zdo_vec3 = new();
@@ -314,13 +318,13 @@ public class SmoothSave : BaseUnityPlugin
 
 				zdoMan.m_saveData = new ZDOMan.SaveData
 				{
-					m_sessionID = zdoMan.m_sessionID,
-					m_zdos = saveZDOs,
+					m_objectsByChunk = new List<Tuple<ZoneSystem.ChunkIndex, List<ZDO>>>(),
 				};
 
 				yield return null;
 
 				copiedZdos = saveZDOs;
+				copiedZdoChunks = saveZDOChunks;
 				copiedZdoIndices = zdoIndex;
 				copiedZdo_floats = zdo_floats;
 				copiedZdo_vec3 = zdo_vec3;
@@ -345,9 +349,11 @@ public class SmoothSave : BaseUnityPlugin
 							if (zdo.Persistent)
 							{
 								ZDOID zdoid = zdo.m_uid;
+								ZoneSystem.ChunkIndex chunkIndex = ZoneSystem.GetZonesChunk(zdo.GetSectorIndex());
 
 								zdoIndex.Add(zdoid, saveZDOs.Count);
 								saveZDOs.Add(zdo.Clone());
+								saveZDOChunks.Add(chunkIndex);
 
 								if (ZDOExtraData.s_floats.TryGetValue(zdoid, out BinarySearchDictionary<int, float>? value_floats))
 								{
@@ -401,26 +407,32 @@ public class SmoothSave : BaseUnityPlugin
 				{
 					int lastIndex = saveZDOs.Count - 1;
 					saveZDOs[removedIndex] = saveZDOs[lastIndex];
+					saveZDOChunks[removedIndex] = saveZDOChunks[lastIndex];
 					saveZDOs.RemoveAt(lastIndex);
+					saveZDOChunks.RemoveAt(lastIndex);
 				}
 				removedIndices.Clear();
 
-				long outsideSectorStart = stopwatch.ElapsedMilliseconds;
-
-				foreach (List<ZDO> zdoList in zdoMan.m_objectsByOutsideSector.Values)
-				{
-					foreach (ZDO zdo in zdoList)
-					{
-						if (zdo.Persistent)
-						{
-							saveZDOs.Add(zdo.Clone());
-						}
-					}
-				}
-
 				stopwatch.Stop();
 
-				zdoMan.m_saveData.m_nextUid = zdoMan.m_nextUid;
+				Dictionary<ZoneSystem.ChunkIndex, List<ZDO>> saveObjectsByChunk = new();
+				for (int i = 0; i < saveZDOs.Count; ++i)
+				{
+					ZoneSystem.ChunkIndex chunkIndex = saveZDOChunks[i];
+					if (!saveObjectsByChunk.TryGetValue(chunkIndex, out List<ZDO>? chunkObjects))
+					{
+						chunkObjects = new List<ZDO>();
+						saveObjectsByChunk.Add(chunkIndex, chunkObjects);
+					}
+					chunkObjects.Add(saveZDOs[i]);
+				}
+
+				List<Tuple<ZoneSystem.ChunkIndex, List<ZDO>>> objectsByChunk = saveObjectsByChunk
+					.OrderBy(entry => entry.Key.Chunk)
+					.Select(entry => Tuple.Create(entry.Key, entry.Value))
+					.ToList();
+
+				zdoMan.m_saveData.m_objectsByChunk = objectsByChunk;
 
 				ZDOExtraData.s_saveFloats = zdo_floats;
 				ZDOExtraData.s_saveVec3s = zdo_vec3;
@@ -429,8 +441,6 @@ public class SmoothSave : BaseUnityPlugin
 				ZDOExtraData.s_saveLongs = zdo_longs;
 				ZDOExtraData.s_saveStrings = zdo_strings;
 				ZDOExtraData.s_saveByteArrays = zdo_byteArrays;
-
-				long outsideSectorTime = stopwatch.ElapsedMilliseconds - outsideSectorStart;
 
 				long connectionHashDataStart = stopwatch.ElapsedMilliseconds;
 
@@ -445,7 +455,7 @@ public class SmoothSave : BaseUnityPlugin
 				}
 				else if (saveLoggingOutput.Value == Logging.Detailed)
 				{
-					Log($"Copying ZDOs into internal buffer took {stopwatch.ElapsedMilliseconds} ms. (Longest blocking time: {longestBlockingTime} ms, copying ZDOs outside sector time: {outsideSectorTime} ms, saving connections: {connectionHashDataTime} ms).");
+					Log($"Copying ZDOs into internal buffer took {stopwatch.ElapsedMilliseconds} ms. (Longest blocking time: {longestBlockingTime} ms, saving connections: {connectionHashDataTime} ms).");
 				}
 
 				ZoneSystem.instance.PrepareSave();
